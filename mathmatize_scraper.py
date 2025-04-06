@@ -24,8 +24,20 @@ from datetime import datetime, date
 from dotenv import load_dotenv
 import requests
 from tqdm import tqdm
-import psycopg2
-from psycopg2.extras import Json
+from collections import defaultdict # Import defaultdict
+
+# Import psycopg2 if --db is set
+if "--db" in sys.argv:
+    try:
+        import psycopg2
+        import psycopg2.extras
+        from psycopg2.extras import Json
+    except ImportError as e:
+        print("Error importing psycopg2:", str(e))
+        print("Please make sure PostgreSQL is installed and try:")
+        print("pip uninstall psycopg2")
+        print("pip install psycopg2-binary")
+        sys.exit(1)
 
 def get_connection():
     try:
@@ -623,9 +635,12 @@ def get_firebase_api_key():
     logger.error("Could not obtain Firebase API key from any source")
     return None
 
-def authenticate(fbname, fbkey):
+def authenticate(fbname, fbkey, should_store_db: bool):
     global auth_state
-    fb_req = get_fb_req()
+    if should_store_db:
+        fb_req = get_fb_req()
+    else:
+        fb_req = None
     if fb_req:
         fk = fb_req.get("firebase_api_key")
         if not fk:
@@ -664,14 +679,14 @@ def authenticate(fbname, fbkey):
         resp = r.json()
         auth_state.id_token = resp.get("idToken")
         auth_state.jwt_token = auth_state.id_token
-
-        store_fb_req(
-            fbname=fbname,
-            fbkey=fbkey,
-            firebase_api_key=fk,
-            id_token=auth_state.id_token,
-            jwt_token=auth_state.jwt_token
-        )
+        if should_store_db:
+            store_fb_req(
+                fbname=fbname,
+                fbkey=fbkey,
+                firebase_api_key=fk,
+                id_token=auth_state.id_token,
+                jwt_token=auth_state.jwt_token
+            )
 
         # Next step => session
         fancy_progress_bar(VERBOSE, "Verifying session with MathMatize", 15, DELAYS.HEADER)
@@ -703,16 +718,20 @@ def get_assignments():
         r = requests.get(url, headers=hh)
         if r.status_code != 200:
             logger.error(f"Could not get assignments => {r.status_code}")
-            return None
+            return None, None, None, None  # Return None for all expected values
         
         print_section(VERBOSE, "Raw assignment data:", r.text, delay=DELAYS.RAW)
         
         d = r.json()
         tasks = d.get("tasks_by_id", {})
         progress = d.get("progress_by_task", {})
+        topics_by_id = d.get("topics_by_id", {})
+        topic_list = d.get("topic_list", [])
+        
         if not tasks:
             logger.error("No tasks found in response.")
-            return None
+            return None, None, None, None
+            
         out = []
         if not VERBOSE:
             task_iter = tqdm(tasks.items(), desc="Processing assignments", unit="assignment", leave=True, position=0)
@@ -724,6 +743,7 @@ def get_assignments():
             out.append({
                 "name": val.get("name"),
                 "id": tid,
+                "topic": val.get("topic"), # Add topic ID
                 "description": val.get("description"),
                 "open_date": val.get("open_date"),
                 "due_date": val.get("target_due_date"),
@@ -740,10 +760,12 @@ def get_assignments():
         print_section(VERBOSE, "Formatted assignment data:", formatted_data, delay=DELAYS.FINAL_JSON)
         
         logger.info(f"Found {len(out)} assignments.")
-        return out
+        # Return assignments, tasks_by_id, topics_by_id, topic_list
+        return out, tasks, topics_by_id, topic_list 
     except Exception as e:
         logger.error(f"Exception => {e}")
-        return None
+        # Return None for all expected values in case of exception
+        return None, None, None, None
 
 def get_attempts(task_id):
     url = "https://www.mathmatize.com/api/mm/attempts/"
@@ -965,8 +987,8 @@ def main():
                         help="When used with --verbose, disables all delays in output.")
     parser.add_argument("--matrix", action="store_true",
                         help="Only output raw encrypted payloads.")
-    parser.add_argument("--no-db", action="store_true",
-                        help="Skip database storage.")
+    parser.add_argument("--db", action="store_true",
+                        help="Perform database storage.")
     args = parser.parse_args()
 
     # Set global flags
@@ -998,11 +1020,11 @@ def main():
         return
 
     # Initialize database if needed
-    if not args.no_db:
+    if args.db:
         print_chars(VERBOSE, "Initializing database...", delay=DELAYS.HEADER)
         if not init_database():
             logger.error("Failed to initialize database. Continuing without database storage.")
-            args.no_db = True
+            args.db = False
 
     logger.setLevel(logging.ERROR if args.matrix else (logging.DEBUG if VERBOSE else logging.INFO))
     
@@ -1010,204 +1032,293 @@ def main():
     print_chars(VERBOSE, "MathMatize Scraper starting...", delay=DELAYS.HEADER)
 
     # 1) AUTH
-    if not authenticate(fbname, fbkey):
+    if not authenticate(fbname, fbkey, args.db):
         logger.error("Auth failed. Exiting.")
         return
 
     # 2) GET ASSIGNMENTS
-    asgs = get_assignments()
-    if not asgs:
-        logger.error("No assignments. Exiting.")
+    asgs, tasks, topics_by_id, topic_list = get_assignments()
+    if not asgs or tasks is None or topics_by_id is None or topic_list is None: # Check all returned values
+        logger.error("Failed to get assignments or topic data. Exiting.")
         return
 
+    # Write summary file for ALL assignments first
     asg_file = os.path.join(outputs_dir, f"mathmatize_assignments_{now_str}.txt")
-    ex_file = os.path.join(outputs_dir, f"mathmatize_exercises_{now_str}.json")
     with open(asg_file,"w",encoding="utf-8") as f:
         for a in asgs:
-            # Store assignment in database
-            if not args.no_db:
+            # Store assignment in database if not skipped
+            if args.db:
                 if store_assignment(a):
-                    print_chars(VERBOSE, f"Stored assignment {a['name']} in database", delay=DELAYS.HEADER)
+                    print_chars(VERBOSE, f"Stored assignment {a['name']} (Summary) in database", delay=DELAYS.RAW) # Use RAW for speed
                 else:
-                    logger.error(f"Failed to store assignment {a['name']} in database")
-            
+                    logger.error(f"Failed to store assignment {a['name']} (Summary) in database")
+
             # Write to file as before
             json_str = json.dumps(a)
             sanitized_json = sanitize_output(json_str, is_json=True)
             f.write(sanitized_json + "\n")
+    print_chars(VERBOSE, f"\nWrote assignment summary => {asg_file}", delay=DELAYS.HEADER)
 
-    print_chars(VERBOSE, f"Wrote assignment summary => {asg_file}", delay=DELAYS.HEADER, with_border=False)
-    print_chars(VERBOSE, f"Wrote assignments to {asg_file}", delay=DELAYS.HEADER, with_border=False)
-
-    # 3) For each assignment
-    all_ex = {}
-    print_chars(VERBOSE, "\nProcessing assignments...", delay=DELAYS.HEADER)
-        
+    # Group assignments by topic ID
+    assignments_by_topic = defaultdict(list)
     for a in asgs:
-        tid = a["id"]
-        if not tid:
-            print_chars(VERBOSE, f"Skipping {a['name']} => no ID!", delay=DELAYS.RAW, with_border=False)
+        topic_id = a.get("topic")
+        if topic_id is not None:
+            assignments_by_topic[topic_id].append(a)
+
+    # 3) Process assignments topic by topic
+    all_ex = {}
+    skip_remaining_topics = False
+    print_chars(VERBOSE, "\nProcessing assignments by topic...", delay=DELAYS.HEADER)
+
+    # Iterate through topics in the order provided by topic_list
+    topic_iter = topic_list
+    if not VERBOSE:
+        topic_iter = tqdm(topic_list, desc="Processing Topics", unit="topic", leave=True)
+
+    for topic_id in topic_iter:
+        if skip_remaining_topics:
+            print_chars(VERBOSE, f"\nSkipping remaining topics...", delay=DELAYS.HEADER)
+            break
+
+        topic_name = topics_by_id.get(str(topic_id), {}).get("name", f"Unknown Topic {topic_id}")
+        assignments_in_topic = assignments_by_topic.get(topic_id, [])
+
+        if not assignments_in_topic:
+            print_chars(VERBOSE, f"\nNo assignments found for Topic: {topic_name} (ID: {topic_id}). Skipping.", delay=DELAYS.RAW)
             continue
-            
-        # Check if assignment is past due
-        due_date = a.get("due_date")
-        if due_date:
-            try:
-                due = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
-                now = datetime.now(due.tzinfo)
-                if now > due:
-                    print_chars(VERBOSE, f"\nSkipping {a['name']} - Past due ({due_date})", delay=DELAYS.RAW, with_border=False)
-                    continue
-            except ValueError as e:
-                logger.error(f"Error parsing due date: {e}")
-            
-        print_chars(VERBOSE, f"\nProcessing assignment: {a['name']}", delay=DELAYS.HEADER)
-            
-        attempts_data = get_attempts(tid)
-        if not attempts_data:
-            print_chars(VERBOSE, "No attempts data => skipping.", delay=DELAYS.RAW, with_border=False)
+
+        if not VERBOSE:
+            topic_iter.set_description(f"Topic: {topic_name}")
+
+        # Prompt user to process this topic
+        log_banner(VERBOSE, f"TOPIC: {topic_name}")
+        print(f"\nFound {len(assignments_in_topic)} assignments for Topic: {topic_name}")
+        user_choice = input("Process this topic? (y=yes, n=no, s=skip all remaining): ").strip().lower()
+
+        if user_choice == 'n':
+            print_chars(VERBOSE, f"Skipping Topic: {topic_name}", delay=DELAYS.HEADER)
             continue
+        elif user_choice == 's':
+            print_chars(VERBOSE, f"Skipping Topic: {topic_name} and all remaining topics.", delay=DELAYS.HEADER)
+            skip_remaining_topics = True
+            continue
+
+        # Process assignments within the current topic
+        print_chars(VERBOSE, f"\nProcessing assignments for Topic: {topic_name}...", delay=DELAYS.HEADER)
+        assignments_iter = assignments_in_topic
+        if not VERBOSE:
+             # Inner tqdm for assignments within the topic
+            assignments_iter = tqdm(assignments_in_topic, desc=f"Assignments in {topic_name}", unit="asg", leave=False) # leave=False for inner loop
+
+        for a in assignments_iter:
+            tid = a["id"]
+            # The check for tid null/empty is likely redundant now but kept for safety
+            if not tid:
+                print_chars(VERBOSE, f"Skipping {a['name']} => no ID!", delay=DELAYS.RAW, with_border=False)
+                continue
+
+            # Check if assignment is past due (already done in the main loop logic)
+            due_date = a.get("due_date")
+            is_past_due = False
+            if due_date:
+                try:
+                    due = datetime.fromisoformat(due_date.replace('Z', '+00:00'))
+                    now = datetime.now(due.tzinfo)
+                    if now > due:
+                        is_past_due = True
+                        print_chars(VERBOSE, f"\nSkipping {a['name']} - Past due ({due_date})", delay=DELAYS.RAW, with_border=False)
+                except ValueError as e:
+                    logger.error(f"Error parsing due date for assignment {a['name']}: {e}")
             
-        exids = attempts_data["exercise_ids"]
-        atts = attempts_data["attempts"]
+            if is_past_due:
+                continue # Skip to next assignment if past due
 
-        # pick first attempt or create
-        if atts:
-            attempt_id = atts[0].get("id")
-        else:
-            attempt_id = create_attempt(tid, a)  # Pass the assignment data here
 
-        # get ex data
-        ex_data_list = []
-        if not VERBOSE and exids:
-            exercise_iter = tqdm(exids, desc=f"Exercises for {a['name']}", unit="ex", leave=True)
-        else:
-            exercise_iter = exids
-            
-        for exid in exercise_iter:
-            d = get_exercise_data(exid)
-            if d:
-                # Store exercise in database
-                if not args.no_db:
-                    if store_exercise(d, tid):
-                        print_chars(VERBOSE, f"Stored exercise {d['id']} in database", delay=DELAYS.HEADER)
-                    else:
-                        logger.error(f"Failed to store exercise {d['id']} in database")
-                
-                ex_data_list.append(d)
-            if not VERBOSE:
-                exercise_iter.set_description(f"Exercise {len(ex_data_list)}/{len(exids)}")
+            print_chars(VERBOSE, f"\nProcessing assignment: {a['name']} (Topic: {topic_name})", delay=DELAYS.HEADER)
 
-        # Store exercise data regardless of auto-answer status
-        if ex_data_list:
-            all_ex[tid] = {
-                "name": a["name"],
-                "exercises": ex_data_list,
-                "attempts": atts
-            }
-            print_chars(VERBOSE, f"Completed processing {a['name']} with {len(ex_data_list)} exercises", delay=DELAYS.HEADER)
+            attempts_data = get_attempts(tid)
+            if not attempts_data:
+                print_chars(VERBOSE, "No attempts data => skipping.", delay=DELAYS.RAW, with_border=False)
+                continue
 
-        # auto-answer?
-        if args.auto_answer and attempt_id:
-            if args.force:
-                
-                log_banner(VERBOSE, f"FORCED AUTO-ANSWER MODE: {a['name']}")
-                print_chars(VERBOSE, f"Assignment: {a['name']}", delay=DELAYS.HEADER, with_border=False)
-                print_chars(VERBOSE, f"Task ID: {tid}", delay=DELAYS.RAW, with_border=False)
-                print_chars(VERBOSE, f"Total Exercises: {len(ex_data_list)}", delay=DELAYS.RAW, with_border=False)
-                print_chars(VERBOSE, "\nForce mode enabled - processing all exercises automatically", delay=DELAYS.HEADER, with_border=False)
-                print_chars(VERBOSE, f"\nForce processing all exercises for {a['name']}", delay=DELAYS.HEADER)
-                
-                # Force mode - process all exercises automatically
-                answer_iter = ex_data_list
-                if not VERBOSE:
-                    answer_iter = tqdm(ex_data_list, desc="Auto-answering", unit="ex", leave=True)
-                
-                for ed in answer_iter:
-                    print_chars(VERBOSE, f"\n{'='*50}", delay=DELAYS.RAW, with_border=False)
-                    print_chars(VERBOSE, f"Processing Exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                    print_chars(VERBOSE, f"{'='*50}", delay=DELAYS.RAW, with_border=False)
-                    
-                    ans = build_answer_data(ed)
-                    if ans:
-                        ok = submit_answer(attempt_id, ans)
-                        if ok:
-                            print_chars(VERBOSE, f"Successfully submitted answer for exercise {ed['id']}", delay=DELAYS.RAW, with_border=False)
-                            fancy_progress_bar(VERBOSE, "Answer submission complete", 5, DELAYS.HEADER)
-                        else:
-                            print_chars(VERBOSE, f"Failed to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                    else:
-                        print_chars(VERBOSE, f"No auto-answer data available for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                    
-                    if not VERBOSE:
-                        answer_iter.set_description(f"Processing answer {ed['id']}")
-                
-                log_banner(VERBOSE, "FORCE AUTO-COMPLETE FINISHED")
-                print_chars(VERBOSE, f"Successfully processed all exercises for {a['name']}", delay=DELAYS.HEADER, with_border=False)
-                print_chars(VERBOSE, f"Auto-completed all exercises for {a['name']}", delay=DELAYS.HEADER)
+            exids = attempts_data["exercise_ids"]
+            atts = attempts_data["attempts"]
+
+            # pick first attempt or create
+            if atts:
+                attempt_id = atts[0].get("id")
+                if not attempt_id and len(atts) > 1: # Safety check if first attempt has no ID somehow
+                    attempt_id = atts[1].get("id")
+                if not attempt_id: # If still no ID, try creating one
+                    print_chars(VERBOSE, f"Found {len(atts)} attempts but no usable ID for task {tid}. Trying to create a new one.", delay=DELAYS.RAW)
+                    attempt_id = create_attempt(tid, a)
+                elif VERBOSE:
+                     print_chars(VERBOSE, f"Using existing attempt ID: {attempt_id} for task {tid}", delay=DELAYS.RAW)
+
             else:
-                log_banner(VERBOSE, f"AUTO-ANSWER MODE: {a['name']}")
-                print_chars(VERBOSE, f"Assignment: {a['name']}", delay=DELAYS.HEADER, with_border=False)
-                print_chars(VERBOSE, f"Task ID: {tid}", delay=DELAYS.RAW, with_border=False)
-                print_chars(VERBOSE, f"Total Exercises: {len(ex_data_list)}", delay=DELAYS.RAW, with_border=False)
-                print_chars(VERBOSE, f"\nTask {tid} => {len(ex_data_list)} exercises. Auto-Answer? (y/n/a for auto-complete all)", delay=DELAYS.RAW, with_border=False)
-                print_chars(VERBOSE, f"\nTask {a['name']} has {len(ex_data_list)} exercises. Auto-Answer? (y/n/a for auto-complete all)", delay=DELAYS.RAW, with_border=False)
-                c = input("> ").strip().lower()
-                if c.startswith("y") or c.startswith("a"):
+                attempt_id = create_attempt(tid, a)  # Pass the assignment data here
+
+            if not attempt_id:
+                logger.error(f"Could not get or create an attempt ID for assignment {a['name']}. Skipping exercise processing.")
+                continue
+
+
+            # get ex data
+            ex_data_list = []
+            if not VERBOSE and exids:
+                exercise_iter = tqdm(exids, desc=f"Exercises for {a['name']}", unit="ex", leave=False) # leave=False for inner loop
+            else:
+                exercise_iter = exids
+
+            for exid in exercise_iter:
+                d = get_exercise_data(exid)
+                if d:
+                    # Store exercise in database
+                    if args.db:
+                        if store_exercise(d, tid):
+                            print_chars(VERBOSE, f"Stored exercise {d['id']} for assignment {a['name']} in database", delay=DELAYS.RAW) # Use RAW for speed
+                        else:
+                            logger.error(f"Failed to store exercise {d['id']} for assignment {a['name']} in database")
+
+                    ex_data_list.append(d)
+                if not VERBOSE and exercise_iter: # Check if exercise_iter exists (it might be empty list)
+                    exercise_iter.set_description(f"Fetching Exercise {len(ex_data_list)}/{len(exids)}")
+
+            # Store exercise data regardless of auto-answer status
+            if ex_data_list:
+                # Ensure the topic exists in all_ex before adding assignment data
+                if topic_id not in all_ex:
+                    all_ex[topic_id] = {"topic_name": topic_name, "assignments": {}}
+                
+                # Store assignment specific data under the topic
+                all_ex[topic_id]["assignments"][tid] = {
+                    "name": a["name"],
+                    "exercises": ex_data_list,
+                    "attempts": atts # Store attempts related to this assignment
+                }
+                print_chars(VERBOSE, f"Completed processing {a['name']} with {len(ex_data_list)} exercises", delay=DELAYS.HEADER)
+
+            # auto-answer?
+            if args.auto_answer and attempt_id and ex_data_list: # Check ex_data_list is not empty
+                if args.force:
+
+                    log_banner(VERBOSE, f"FORCED AUTO-ANSWER MODE: {a['name']}")
+                    print_chars(VERBOSE, f"Assignment: {a['name']}", delay=DELAYS.HEADER, with_border=False)
+                    print_chars(VERBOSE, f"Task ID: {tid}", delay=DELAYS.RAW, with_border=False)
+                    print_chars(VERBOSE, f"Total Exercises: {len(ex_data_list)}", delay=DELAYS.RAW, with_border=False)
+                    print_chars(VERBOSE, "\nForce mode enabled - processing all exercises automatically", delay=DELAYS.HEADER, with_border=False)
+
+                    # Force mode - process all exercises automatically
                     answer_iter = ex_data_list
-                    auto_complete_all = c.startswith("a")
-                    if auto_complete_all:
-                        log_banner(VERBOSE, "AUTO-COMPLETE ALL EXERCISES")
-                    else:
-                        log_banner(VERBOSE, "INTERACTIVE AUTO-ANSWER MODE")
                     if not VERBOSE:
-                        answer_iter = tqdm(ex_data_list, desc="Auto-answering", unit="ex", leave=True)
+                        answer_iter = tqdm(ex_data_list, desc=f"Auto-answering {a['name']}", unit="ex", leave=False) # leave=False for inner loop
+
                     for ed in answer_iter:
-                        
                         print_chars(VERBOSE, f"\n{'='*50}", delay=DELAYS.RAW, with_border=False)
                         print_chars(VERBOSE, f"Processing Exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
                         print_chars(VERBOSE, f"{'='*50}", delay=DELAYS.RAW, with_border=False)
-                        
+
                         ans = build_answer_data(ed)
                         if ans:
-                            if not auto_complete_all:
-                                print_chars(VERBOSE, f"\nReady to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                                print_chars(VERBOSE, "Submit this answer? (y/n)", delay=DELAYS.RAW, with_border=False)
-                                print_chars(VERBOSE, f"Submit answer for exercise {ed['id']}? (y/n)", delay=DELAYS.RAW, with_border=False)
-                                c2 = input("> ").strip().lower()
-                                should_submit = c2.startswith('y')
+                            ok = submit_answer(attempt_id, ans)
+                            if ok:
+                                print_chars(VERBOSE, f"Successfully submitted answer for exercise {ed['id']}", delay=DELAYS.RAW, with_border=False)
+                                fancy_progress_bar(VERBOSE, "Answer submission complete", 5, DELAYS.HEADER)
                             else:
-                                should_submit = True
-                                
-                            if should_submit:
-                                ok = submit_answer(attempt_id, ans)
-                                if ok:
-                                    print_chars(VERBOSE, f"Successfully submitted answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                                    fancy_progress_bar(VERBOSE, "Answer submission complete", 5, DELAYS.HEADER)
-                                else:                                    
-                                    print_chars(VERBOSE, f"Failed to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                            else:
-                                print_chars(VERBOSE, f"Skipped submitting answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                                print_chars(VERBOSE, f"Failed to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
                         else:
                             print_chars(VERBOSE, f"No auto-answer data available for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
-                        if not VERBOSE:
-                            answer_iter.set_description(f"Processing answer {ed['id']}")
-                    if auto_complete_all:
-                        log_banner(VERBOSE, "AUTO-COMPLETE FINISHED")
-                        print_chars(VERBOSE, f"Successfully processed all exercises for {a['name']}", delay=DELAYS.HEADER, with_border=False)
-                        print_chars(VERBOSE, f"Auto-completed all exercises for {a['name']}", delay=DELAYS.HEADER)
-                    print_chars(VERBOSE, "Skipping auto-answers for this assignment.", delay=DELAYS.HEADER, with_border=False)
 
+                        if not VERBOSE:
+                             answer_iter.set_description(f"Answering Ex {ed['id']}")
+
+
+                    log_banner(VERBOSE, "FORCE AUTO-COMPLETE FINISHED for " + a['name'])
+                    print_chars(VERBOSE, f"Successfully processed all exercises for {a['name']}", delay=DELAYS.HEADER, with_border=False)
+                else:
+                    # Interactive Auto-Answer Per Assignment
+                    log_banner(VERBOSE, f"AUTO-ANSWER MODE: {a['name']}")
+                    print_chars(VERBOSE, f"Assignment: {a['name']}", delay=DELAYS.HEADER, with_border=False)
+                    print_chars(VERBOSE, f"Task ID: {tid}", delay=DELAYS.RAW, with_border=False)
+                    print_chars(VERBOSE, f"Total Exercises: {len(ex_data_list)}", delay=DELAYS.RAW, with_border=False)
+                    print_chars(VERBOSE, f"\nTask {a['name']} has {len(ex_data_list)} exercises. Auto-Answer this assignment? (y/n/a for auto-complete all for this assignment)", delay=DELAYS.RAW, with_border=False)
+
+                    c = input("> ").strip().lower()
+                    if c.startswith("y") or c.startswith("a"):
+                        answer_iter = ex_data_list
+                        auto_complete_assignment = c.startswith("a") # Auto-complete just this assignment
+                        if auto_complete_assignment:
+                            log_banner(VERBOSE, f"AUTO-COMPLETING ALL EXERCISES FOR: {a['name']}")
+                        else:
+                            log_banner(VERBOSE, f"INTERACTIVE AUTO-ANSWER MODE FOR: {a['name']}")
+                        if not VERBOSE:
+                            answer_iter = tqdm(ex_data_list, desc=f"Auto-answering {a['name']}", unit="ex", leave=False) # leave=False for inner loop
+
+                        for ed in answer_iter:
+
+                            print_chars(VERBOSE, f"\n{'='*50}", delay=DELAYS.RAW, with_border=False)
+                            print_chars(VERBOSE, f"Processing Exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                            print_chars(VERBOSE, f"{'='*50}", delay=DELAYS.RAW, with_border=False)
+
+                            ans = build_answer_data(ed)
+                            if ans:
+                                if not auto_complete_assignment: # If not auto-completing the whole assignment, ask per exercise
+                                    print_chars(VERBOSE, f"\nReady to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                                    print_chars(VERBOSE, f"Submit answer for exercise {ed['id']}? (y/n)", delay=DELAYS.RAW, with_border=False)
+
+                                    c2 = input("> ").strip().lower()
+                                    should_submit = c2.startswith('y')
+                                else: # Auto-completing assignment, so always submit
+                                    should_submit = True
+
+                                if should_submit:
+                                    ok = submit_answer(attempt_id, ans)
+                                    if ok:
+                                        print_chars(VERBOSE, f"Successfully submitted answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                                        fancy_progress_bar(VERBOSE, "Answer submission complete", 5, DELAYS.HEADER)
+                                    else:
+                                        print_chars(VERBOSE, f"Failed to submit answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                                else:
+                                    print_chars(VERBOSE, f"Skipped submitting answer for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+                            else:
+                                print_chars(VERBOSE, f"No auto-answer data available for exercise {ed['id']}", delay=DELAYS.HEADER, with_border=False)
+
+                            if not VERBOSE:
+                                answer_iter.set_description(f"Answering Ex {ed['id']}")
+
+                        if auto_complete_assignment:
+                            log_banner(VERBOSE, f"AUTO-COMPLETE FINISHED FOR: {a['name']}")
+                            print_chars(VERBOSE, f"Successfully processed all exercises for {a['name']}", delay=DELAYS.HEADER, with_border=False)
+
+                    else: # User chose 'n' for the assignment
+                         print_chars(VERBOSE, f"Skipping auto-answers for assignment: {a['name']}", delay=DELAYS.HEADER, with_border=False)
+
+
+            elif args.auto_answer and not ex_data_list:
+                 print_chars(VERBOSE, f"No exercises found for assignment {a['name']} to auto-answer.", delay=DELAYS.RAW)
+
+
+    # Ensure the outer topic progress bar finishes correctly if not verbose
+    if not VERBOSE and topic_iter:
+       topic_iter.close()
+
+
+    # Write final exercise data file
+    ex_file = os.path.join(outputs_dir, f"mathmatize_exercises_{now_str}.json")
     if not all_ex:
-        logger.error("No exercise data collected.")
-        return
-    with open(ex_file,"w",encoding="utf-8") as f:
-        # Sanitize the JSON content before writing
-        json_str = json.dumps(all_ex, indent=2, ensure_ascii=False)
-        sanitized_json = sanitize_output(json_str, is_json=True)
-        f.write(sanitized_json)
-        print_chars(VERBOSE, f"\nWrote exercise data to {ex_file}", delay=DELAYS.HEADER, with_border=False)
-        print_chars(VERBOSE, "Mission complete!", delay=DELAYS.HEADER, with_border=False)
+        logger.warning("No exercise data collected or processed.") # Changed to warning
+    else:
+        with open(ex_file,"w",encoding="utf-8") as f:
+            # Sanitize the JSON content before writing
+            json_str = json.dumps(all_ex, indent=2, ensure_ascii=False)
+            sanitized_json = sanitize_output(json_str, is_json=True)
+            f.write(sanitized_json)
+            print_chars(VERBOSE, f"\nWrote collected exercise data to {ex_file}", delay=DELAYS.HEADER, with_border=False)
+
+
+    log_banner(VERBOSE, "SCRIPT COMPLETE")
+    print_chars(VERBOSE, "Mission complete!", delay=DELAYS.HEADER, with_border=False)
 
     # Print matrix data if enabled
     if MATRIX_MODE:
